@@ -100,6 +100,8 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=1)
+    think: bool = False
+    options: dict[str, Any] | None = None
     stream: bool = False
 
 
@@ -158,8 +160,13 @@ async def chat_completions(payload: ChatRequest, _: Request, key: asyncpg.Record
     options: dict[str, Any] = {"num_ctx": MAX_CONTEXT_TOKENS, "num_predict": min(payload.max_tokens or MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)}
     if payload.temperature is not None:
         options["temperature"] = payload.temperature
+    if payload.options:
+        allowed_options = {"top_k", "top_p", "min_p", "typical_p", "repeat_last_n", "repeat_penalty", "presence_penalty", "frequency_penalty", "seed", "stop"}
+        if set(payload.options) - allowed_options:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported Ollama option")
+        options.update(payload.options)
     try:
-        response = await app.state.http.post(f"{OLLAMA_URL}/api/chat", json={"model": model, "messages": [message.model_dump() for message in payload.messages], "stream": False, "think": False, "options": options})
+        response = await app.state.http.post(f"{OLLAMA_URL}/api/chat", json={"model": model, "messages": [message.model_dump() for message in payload.messages], "stream": False, "think": payload.think, "options": options})
         response.raise_for_status()
         upstream = response.json()
     except httpx.HTTPError as exc:
