@@ -1,0 +1,14 @@
+services:
+  gateway:
+    build: .
+    container_name: llm-gateway
+    env_file: .env
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
