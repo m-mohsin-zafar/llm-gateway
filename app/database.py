@@ -309,5 +309,18 @@ async def migrate_schema(connection) -> None:
             DEFAULT 'openai';
         ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS endpoint TEXT NOT NULL
             DEFAULT '/v1/chat/completions';
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'usage_events'
+                  AND column_name = 'request_id'
+                  AND data_type <> 'text'
+            ) THEN
+                ALTER TABLE usage_events ALTER COLUMN request_id TYPE TEXT
+                    USING request_id::TEXT;
+            END IF;
+        END $$;
         """
     )

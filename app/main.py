@@ -10,6 +10,11 @@ from typing import Any
 import asyncpg
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
@@ -17,6 +22,8 @@ from pydantic import BaseModel, Field
 from app.config import Settings
 from app.database import ApiKeyRepository, PostgresKeyStore, PostgresUsageStore, UsageRepository, migrate_schema
 from app.dependencies import DatabaseProbe, GatewayServices
+from app.errors import ollama_error
+from app.routers.ollama import create_ollama_router
 from app.upstream import InferenceAdmission, UpstreamClient
 
 SETTINGS = Settings.from_env()
@@ -132,6 +139,31 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
         response.headers["X-Request-ID"] = request_id
         return response
 
+    @application.exception_handler(HTTPException)
+    async def protocol_http_exception(request: Request, exc: HTTPException):
+        if request.url.path.startswith("/api/"):
+            response = ollama_error(
+                exc.status_code,
+                str(exc.detail),
+                request_id=getattr(request.state, "request_id", None),
+            )
+            if exc.headers:
+                response.headers.update(exc.headers)
+            return response
+        return await http_exception_handler(request, exc)
+
+    @application.exception_handler(RequestValidationError)
+    async def protocol_validation_exception(
+        request: Request, exc: RequestValidationError
+    ):
+        if request.url.path.startswith("/api/"):
+            return ollama_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "Invalid request",
+                request_id=getattr(request.state, "request_id", None),
+            )
+        return await request_validation_exception_handler(request, exc)
+
     @application.get("/health", tags=["system"])
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -153,6 +185,8 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
 
             return JSONResponse(payload, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
         return payload
+
+    application.include_router(create_ollama_router(settings))
 
     return application
 

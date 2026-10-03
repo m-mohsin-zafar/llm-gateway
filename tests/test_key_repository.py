@@ -168,6 +168,7 @@ async def test_additive_migration_preserves_existing_rows_and_usage_history():
     assert "ADD COLUMN IF NOT EXISTS SCOPES" in sql
     assert "ADD COLUMN IF NOT EXISTS PROTOCOL" in sql
     assert "ADD COLUMN IF NOT EXISTS ENDPOINT" in sql
+    assert "ALTER COLUMN REQUEST_ID TYPE TEXT" in sql
     assert "DROP TABLE" not in sql
     assert "TRUNCATE" not in sql
     assert "DELETE FROM API_KEYS" not in sql

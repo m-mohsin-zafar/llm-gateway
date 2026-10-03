@@ -135,6 +135,31 @@ async def test_stream_preserves_sse_and_ndjson_bytes(content_type, chunks):
 
 @requires_upstream
 @pytest.mark.asyncio
+async def test_stream_usage_failure_does_not_break_response_forwarding():
+    from app.upstream import UpstreamClient, UsageContext
+
+    class FailingUsage:
+        async def record(self, **_event):
+            raise RuntimeError("database unavailable")
+
+    stream = ClosingStream([b'{"done":true}\n'])
+
+    async def handler(_request: httpx.Request):
+        return httpx.Response(200, stream=stream)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    upstream = UpstreamClient(client, "http://127.0.0.1:11434")
+    usage = UsageContext(FailingUsage(), {"request_id": "req-usage"})
+
+    received = [chunk async for chunk in upstream.stream("POST", "/api/chat", {}, usage)]
+
+    assert received == [b'{"done":true}\n']
+    assert stream.closed is True
+    await client.aclose()
+
+
+@requires_upstream
+@pytest.mark.asyncio
 async def test_disconnected_stream_closes_upstream_releases_slot_and_records_failure():
     from app.upstream import InferenceAdmission, UpstreamClient, UsageContext
 

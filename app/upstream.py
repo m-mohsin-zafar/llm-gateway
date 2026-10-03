@@ -83,6 +83,7 @@ class UpstreamClient:
         payload: Any,
         usage: UsageContext | None = None,
     ) -> AsyncIterator[bytes]:
+        started = time.perf_counter()
         request = self.client.build_request(
             method, f"{self.base_url}{path}", json=payload
         )
@@ -94,7 +95,6 @@ class UpstreamClient:
             raise UpstreamUnavailable("Ollama is unavailable") from exc
 
         complete = False
-        started = time.perf_counter()
         try:
             async for chunk in response.aiter_raw():
                 yield chunk
@@ -105,7 +105,11 @@ class UpstreamClient:
                 values = dict(usage.values)
                 values["duration_ms"] = int((time.perf_counter() - started) * 1000)
                 values["status_code"] = response.status_code if complete else 499
-                await usage.repository.record(**values)
+                try:
+                    await usage.repository.record(**values)
+                except Exception:
+                    # Usage storage must not corrupt an otherwise valid stream.
+                    pass
 
     @staticmethod
     def _safe_headers(headers: httpx.Headers) -> dict[str, str]:
