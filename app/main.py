@@ -15,6 +15,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 from app.config import Settings
+from app.database import ApiKeyRepository, PostgresKeyStore, PostgresUsageStore, UsageRepository, migrate_schema
 from app.dependencies import DatabaseProbe, GatewayServices, OllamaProbe
 
 SETTINGS = Settings.from_env()
@@ -92,11 +93,15 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
         http = httpx.AsyncClient(timeout=httpx.Timeout(settings.request_timeout_seconds))
         application.state.pool = pool
         application.state.http = http
+        await initialize_database(pool)
+        async with pool.acquire() as connection:
+            await migrate_schema(connection)
         application.state.services = GatewayServices(
             database=DatabaseProbe(pool),
             upstream=OllamaProbe(http, settings.ollama_url),
+            keys=ApiKeyRepository(PostgresKeyStore(pool)),
+            usage=UsageRepository(PostgresUsageStore(pool)),
         )
-        await initialize_database(pool)
         try:
             yield
         finally:

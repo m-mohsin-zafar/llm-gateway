@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import asyncpg
 import httpx
@@ -15,6 +15,8 @@ class ReadinessProbe(Protocol):
 class GatewayServices:
     database: ReadinessProbe
     upstream: ReadinessProbe
+    keys: Any | None = None
+    usage: Any | None = None
 
 
 class DatabaseProbe:
