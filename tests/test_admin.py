@@ -37,3 +37,6 @@ def test_admin_template_and_key_lifecycle(settings, fake_database, fake_upstream
     assert "llmgw_never-render-this" not in page.text and "secret" not in listed.json()[0]
     for label in ("Overview", "API Keys", "Integration Guide", "Reference", "Pydantic AI", "LangChain", "LangGraph", "think: false"):
         assert label in page.text
+    assert 'id="create-key"' in page.text
+    assert 'id="key-form"' in page.text
+    assert 'id="requests-total"' in page.text

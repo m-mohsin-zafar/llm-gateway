@@ -30,7 +30,16 @@ def create_admin_router(settings: Settings) -> APIRouter:
 
     @router.get("/admin", response_class=HTMLResponse)
     async def dashboard(request: Request, _: None = Depends(authenticate)):
-        return templates.TemplateResponse(request, "admin.html", {"settings": settings, "keys": await keys(request).list()})
+        overview = {"requests": 0, "tokens": 0, "latency": 0, "errors": 0}
+        usage_by_key = {}
+        pool = getattr(request.app.state, "pool", None)
+        if pool is not None:
+            async with pool.acquire() as connection:
+                totals = await connection.fetchrow("SELECT count(*) requests, coalesce(sum(prompt_tokens + completion_tokens), 0) tokens, coalesce(round(avg(duration_ms)), 0) latency, count(*) filter (where status_code >= 400) errors FROM usage_events WHERE created_at >= now() - interval '24 hours'")
+                overview = dict(totals)
+                rows = await connection.fetch("SELECT api_key_id, count(*) requests, coalesce(sum(prompt_tokens), 0) prompt, coalesce(sum(completion_tokens), 0) completion, count(*) filter (where status_code >= 400) errors, coalesce(round(avg(duration_ms)), 0) latency FROM usage_events WHERE created_at >= now() - interval '24 hours' GROUP BY api_key_id")
+                usage_by_key = {row["api_key_id"]: dict(row) for row in rows}
+        return templates.TemplateResponse(request, "admin.html", {"settings": settings, "keys": await keys(request).list(), "overview": overview, "usage_by_key": usage_by_key})
 
     @router.get("/admin/api-keys")
     async def list_keys(request: Request, _: None = Depends(authenticate)):
