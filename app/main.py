@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import hmac
-import os
 import secrets
 import time
 import uuid
@@ -15,15 +14,19 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "qwen3:4b")
-BOOTSTRAP_API_KEY = os.environ["BOOTSTRAP_API_KEY"]
-ADMIN_USERNAME = os.environ["ADMIN_USERNAME"]
-ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
-REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "180"))
-MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8192"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "1024"))
+from app.config import Settings
+from app.dependencies import DatabaseProbe, GatewayServices, OllamaProbe
+
+SETTINGS = Settings.from_env()
+DATABASE_URL = SETTINGS.database_url
+OLLAMA_URL = SETTINGS.ollama_url
+DEFAULT_MODEL = SETTINGS.default_model
+BOOTSTRAP_API_KEY = SETTINGS.bootstrap_api_key
+ADMIN_USERNAME = SETTINGS.admin_username
+ADMIN_PASSWORD = SETTINGS.admin_password
+REQUEST_TIMEOUT_SECONDS = SETTINGS.request_timeout_seconds
+MAX_CONTEXT_TOKENS = SETTINGS.max_context_tokens
+MAX_OUTPUT_TOKENS = SETTINGS.max_output_tokens
 
 security = HTTPBasic()
 
@@ -77,17 +80,68 @@ async def initialize_database(pool: asyncpg.Pool) -> None:
             )
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
-    app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS))
-    await initialize_database(app.state.pool)
-    yield
-    await app.state.http.aclose()
-    await app.state.pool.close()
+def create_app(settings: Settings, services: GatewayServices | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        if services is not None:
+            application.state.services = services
+            yield
+            return
+
+        pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=4)
+        http = httpx.AsyncClient(timeout=httpx.Timeout(settings.request_timeout_seconds))
+        application.state.pool = pool
+        application.state.http = http
+        application.state.services = GatewayServices(
+            database=DatabaseProbe(pool),
+            upstream=OllamaProbe(http, settings.ollama_url),
+        )
+        await initialize_database(pool)
+        try:
+            yield
+        finally:
+            await http.aclose()
+            await pool.close()
+
+    application = FastAPI(
+        title="LLM Gateway",
+        version="0.2.0",
+        description="Authenticated OpenAI-compatible and Ollama-native inference gateway.",
+        lifespan=lifespan,
+        openapi_tags=[
+            {"name": "system", "description": "Health and readiness endpoints."},
+            {"name": "openai", "description": "OpenAI-compatible API."},
+            {"name": "ollama", "description": "Ollama-native read and inference API."},
+            {"name": "admin", "description": "Gateway administration."},
+        ],
+    )
+
+    @application.get("/health", tags=["system"])
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @application.get("/ready", tags=["system"])
+    async def ready(request: Request):
+        active_services: GatewayServices = request.app.state.services
+        database_ready, ollama_ready = await asyncio.gather(
+            active_services.database.is_ready(),
+            active_services.upstream.is_ready(),
+        )
+        payload = {
+            "status": "ready" if database_ready and ollama_ready else "not_ready",
+            "database": "ok" if database_ready else "unavailable",
+            "ollama": "ok" if ollama_ready else "unavailable",
+        }
+        if not (database_ready and ollama_ready):
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(payload, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return payload
+
+    return application
 
 
-app = FastAPI(title="llm-gateway", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = create_app(SETTINGS)
 
 
 class ChatMessage(BaseModel):
@@ -139,10 +193,6 @@ async def log_usage(key_id: uuid.UUID | None, request_id: uuid.UUID, prompt: int
             uuid.uuid4(), key_id, request_id, DEFAULT_MODEL, prompt, completion, duration_ms, status_code,
         )
 
-
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
 
 
 @app.get("/v1/models")
