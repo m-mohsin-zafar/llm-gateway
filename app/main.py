@@ -16,7 +16,8 @@ from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.database import ApiKeyRepository, PostgresKeyStore, PostgresUsageStore, UsageRepository, migrate_schema
-from app.dependencies import DatabaseProbe, GatewayServices, OllamaProbe
+from app.dependencies import DatabaseProbe, GatewayServices
+from app.upstream import InferenceAdmission, UpstreamClient
 
 SETTINGS = Settings.from_env()
 DATABASE_URL = SETTINGS.database_url
@@ -96,11 +97,13 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
         await initialize_database(pool)
         async with pool.acquire() as connection:
             await migrate_schema(connection)
+        upstream = UpstreamClient(http, settings.ollama_url)
         application.state.services = GatewayServices(
             database=DatabaseProbe(pool),
-            upstream=OllamaProbe(http, settings.ollama_url),
+            upstream=upstream,
             keys=ApiKeyRepository(PostgresKeyStore(pool)),
             usage=UsageRepository(PostgresUsageStore(pool)),
+            admission=InferenceAdmission(max_active=1, max_queue=settings.max_queue),
         )
         try:
             yield
@@ -120,6 +123,14 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
             {"name": "admin", "description": "Gateway administration."},
         ],
     )
+
+    @application.middleware("http")
+    async def request_id_middleware(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or f"req-{uuid.uuid4().hex}"
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
     @application.get("/health", tags=["system"])
     async def health() -> dict[str, str]:

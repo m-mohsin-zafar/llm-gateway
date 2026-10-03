@@ -17,6 +17,7 @@ class GatewayServices:
     upstream: ReadinessProbe
     keys: Any | None = None
     usage: Any | None = None
+    admission: Any | None = None
 
 
 class DatabaseProbe:
