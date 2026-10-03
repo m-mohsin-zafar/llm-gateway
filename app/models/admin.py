@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -32,3 +33,10 @@ class CreateApiKeyRequest(BaseModel):
 
 class UpdateApiKeyRequest(BaseModel):
     enabled: bool
+
+
+class PlaygroundRequest(BaseModel):
+    protocol: Literal["openai", "ollama"] = "openai"
+    prompt: str = Field(min_length=1, max_length=12000)
+    think: bool = False
+    max_tokens: int = Field(default=256, ge=1, le=512)

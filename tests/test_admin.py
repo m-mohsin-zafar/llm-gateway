@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.dependencies import GatewayServices
 from app.models.admin import ApiKeyMetadata, IssuedApiKey
+from app.upstream import UpstreamResponse
 
 
 class AdminKeys:
@@ -40,3 +41,35 @@ def test_admin_template_and_key_lifecycle(settings, fake_database, fake_upstream
     assert 'id="create-key"' in page.text
     assert 'id="key-form"' in page.text
     assert 'id="requests-total"' in page.text
+
+
+class PlaygroundUpstream:
+    async def is_ready(self): return True
+
+    async def request_json(self, method, path, payload):
+        assert method == "POST"
+        assert path == "/v1/chat/completions"
+        assert payload == {
+            "model": "qwen3:4b",
+            "messages": [{"role": "user", "content": "Give me one test idea."}],
+            "max_tokens": 256,
+        }
+        return UpstreamResponse(200, {"choices": [{"message": {"content": "Test invalid input."}}]}, {})
+
+
+def test_admin_playground_runs_a_bounded_openai_prompt(settings, fake_database):
+    from app.main import create_app
+
+    app = create_app(settings, GatewayServices(database=fake_database, upstream=PlaygroundUpstream(), keys=AdminKeys()))
+    with TestClient(app) as client:
+        response = client.post(
+            "/admin/playground",
+            auth=("admin", "test-password"),
+            headers={"X-Requested-With": "llm-gateway-admin"},
+            json={"protocol": "openai", "prompt": "Give me one test idea."},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["output"] == "Test invalid input."
+    assert response.json()["status_code"] == 200
+    assert response.json()["latency_ms"] >= 0

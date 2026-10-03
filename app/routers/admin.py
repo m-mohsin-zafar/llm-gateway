@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hmac
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -9,7 +11,8 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 
 from app.config import Settings
-from app.models.admin import CreateApiKeyRequest, UpdateApiKeyRequest
+from app.models.admin import CreateApiKeyRequest, PlaygroundRequest, UpdateApiKeyRequest
+from app.upstream import InvalidUpstreamResponse, QueueFull, UpstreamTimeout, UpstreamUnavailable
 
 
 def create_admin_router(settings: Settings) -> APIRouter:
@@ -28,6 +31,14 @@ def create_admin_router(settings: Settings) -> APIRouter:
     def keys(request: Request):
         return request.app.state.services.keys
 
+    @asynccontextmanager
+    async def admission(services):
+        if services.admission is None:
+            yield
+            return
+        async with services.admission.acquire():
+            yield
+
     @router.get("/admin", response_class=HTMLResponse)
     async def dashboard(request: Request, _: None = Depends(authenticate)):
         overview = {"requests": 0, "tokens": 0, "latency": 0, "errors": 0}
@@ -44,6 +55,36 @@ def create_admin_router(settings: Settings) -> APIRouter:
     @router.get("/admin/api-keys")
     async def list_keys(request: Request, _: None = Depends(authenticate)):
         return [key.model_dump(mode="json") for key in await keys(request).list()]
+
+    @router.post("/admin/playground")
+    async def playground(payload: PlaygroundRequest, request: Request, _: None = Depends(authenticate), __: None = Depends(csrf)):
+        services = request.app.state.services
+        if payload.protocol == "openai":
+            path = "/v1/chat/completions"
+            upstream_payload = {"model": settings.default_model, "messages": [{"role": "user", "content": payload.prompt}], "max_tokens": payload.max_tokens}
+        else:
+            path = "/api/generate"
+            upstream_payload = {"model": settings.default_model, "prompt": payload.prompt, "stream": False, "think": payload.think, "options": {"num_predict": payload.max_tokens}}
+        started = time.perf_counter()
+        try:
+            async with admission(services):
+                response = await services.upstream.request_json("POST", path, upstream_payload)
+        except QueueFull as exc:
+            raise HTTPException(429, str(exc), headers={"Retry-After": str(exc.retry_after)}) from exc
+        except UpstreamTimeout as exc:
+            raise HTTPException(504, "Ollama request timed out") from exc
+        except UpstreamUnavailable as exc:
+            raise HTTPException(503, "Ollama is unavailable") from exc
+        except InvalidUpstreamResponse as exc:
+            raise HTTPException(502, "Ollama returned an invalid response") from exc
+        if response.status_code >= 400:
+            raise HTTPException(response.status_code, "Ollama rejected the playground request")
+        data = response.data if isinstance(response.data, dict) else {}
+        if payload.protocol == "openai":
+            output = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        else:
+            output = data.get("response", "")
+        return {"output": output, "status_code": response.status_code, "latency_ms": int((time.perf_counter() - started) * 1000)}
 
     @router.post("/admin/api-keys", status_code=201)
     async def create(payload: CreateApiKeyRequest, request: Request, _: None = Depends(authenticate), __: None = Depends(csrf)):
