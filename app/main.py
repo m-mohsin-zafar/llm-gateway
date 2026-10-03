@@ -2,14 +2,12 @@ import asyncio
 import hashlib
 import hmac
 import secrets
-import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any
 
 import asyncpg
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
@@ -17,25 +15,20 @@ from fastapi.exception_handlers import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.database import ApiKeyRepository, PostgresKeyStore, PostgresUsageStore, UsageRepository, migrate_schema
 from app.dependencies import DatabaseProbe, GatewayServices
-from app.errors import ollama_error
+from app.errors import ollama_error, openai_error
 from app.routers.ollama import create_ollama_router
+from app.routers.openai import create_openai_router
 from app.upstream import InferenceAdmission, UpstreamClient
 
 SETTINGS = Settings.from_env()
-DATABASE_URL = SETTINGS.database_url
-OLLAMA_URL = SETTINGS.ollama_url
 DEFAULT_MODEL = SETTINGS.default_model
 BOOTSTRAP_API_KEY = SETTINGS.bootstrap_api_key
 ADMIN_USERNAME = SETTINGS.admin_username
 ADMIN_PASSWORD = SETTINGS.admin_password
-REQUEST_TIMEOUT_SECONDS = SETTINGS.request_timeout_seconds
-MAX_CONTEXT_TOKENS = SETTINGS.max_context_tokens
-MAX_OUTPUT_TOKENS = SETTINGS.max_output_tokens
 
 security = HTTPBasic()
 
@@ -44,15 +37,6 @@ def hash_key(value: str, salt: bytes | None = None) -> str:
     salt = salt or secrets.token_bytes(16)
     digest = hashlib.scrypt(value.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
     return f"{salt.hex()}:{digest.hex()}"
-
-
-def verify_key(value: str, encoded: str) -> bool:
-    try:
-        salt_hex, digest_hex = encoded.split(":", 1)
-        calculated = hash_key(value, bytes.fromhex(salt_hex)).split(":", 1)[1]
-        return hmac.compare_digest(calculated, digest_hex)
-    except (ValueError, AttributeError):
-        return False
 
 
 async def initialize_database(pool: asyncpg.Pool) -> None:
@@ -150,6 +134,23 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
             if exc.headers:
                 response.headers.update(exc.headers)
             return response
+        if request.url.path.startswith("/v1/"):
+            response = openai_error(
+                exc.status_code,
+                str(exc.detail),
+                error_type=(
+                    "authentication_error"
+                    if exc.status_code == 401
+                    else "permission_error"
+                    if exc.status_code == 403
+                    else "invalid_request_error"
+                ),
+                code="authentication_error" if exc.status_code == 401 else None,
+                request_id=getattr(request.state, "request_id", None),
+            )
+            if exc.headers:
+                response.headers.update(exc.headers)
+            return response
         return await http_exception_handler(request, exc)
 
     @application.exception_handler(RequestValidationError)
@@ -160,6 +161,13 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
             return ollama_error(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "Invalid request",
+                request_id=getattr(request.state, "request_id", None),
+            )
+        if request.url.path.startswith("/v1/"):
+            return openai_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "Invalid request",
+                code="invalid_request",
                 request_id=getattr(request.state, "request_id", None),
             )
         return await request_validation_exception_handler(request, exc)
@@ -187,38 +195,12 @@ def create_app(settings: Settings, services: GatewayServices | None = None) -> F
         return payload
 
     application.include_router(create_ollama_router(settings))
+    application.include_router(create_openai_router(settings))
 
     return application
 
 
 app = create_app(SETTINGS)
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str | list[dict[str, Any]]
-
-
-class ChatRequest(BaseModel):
-    model: str = "default"
-    messages: list[ChatMessage] = Field(min_length=1)
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    max_tokens: int | None = Field(default=None, ge=1)
-    think: bool = False
-    options: dict[str, Any] | None = None
-    stream: bool = False
-
-
-async def api_key(x_api_key: str | None = Header(default=None)) -> asyncpg.Record:
-    if not x_api_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-API-Key")
-    async with app.state.pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, name, key_hash FROM api_keys WHERE enabled = TRUE")
-        for row in rows:
-            if verify_key(x_api_key, row["key_hash"]):
-                await conn.execute("UPDATE api_keys SET last_used_at = now() WHERE id = $1", row["id"])
-                return row
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 
 def admin(credentials: HTTPBasicCredentials = Depends(security)) -> str:
@@ -227,62 +209,6 @@ def admin(credentials: HTTPBasicCredentials = Depends(security)) -> str:
     if not (valid_user and valid_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
-
-
-def resolve_model(name: str) -> str:
-    if name not in {"default", DEFAULT_MODEL}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only the default model is currently enabled")
-    return DEFAULT_MODEL
-
-
-async def log_usage(key_id: uuid.UUID | None, request_id: uuid.UUID, prompt: int, completion: int, duration_ms: int, status_code: int) -> None:
-    async with app.state.pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO usage_events (id, api_key_id, request_id, model_alias, upstream_model, prompt_tokens, completion_tokens, duration_ms, status_code)
-               VALUES ($1, $2, $3, 'default', $4, $5, $6, $7, $8)""",
-            uuid.uuid4(), key_id, request_id, DEFAULT_MODEL, prompt, completion, duration_ms, status_code,
-        )
-
-
-
-@app.get("/v1/models")
-async def models(_: asyncpg.Record = Depends(api_key)) -> dict[str, Any]:
-    return {"object": "list", "data": [{"id": "default", "object": "model", "owned_by": "llm-gateway"}]}
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(payload: ChatRequest, _: Request, key: asyncpg.Record = Depends(api_key)) -> dict[str, Any]:
-    if payload.stream:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Streaming is not enabled in the initial deployment")
-    model = resolve_model(payload.model)
-    request_id = uuid.uuid4()
-    started = time.perf_counter()
-    options: dict[str, Any] = {"num_ctx": MAX_CONTEXT_TOKENS, "num_predict": min(payload.max_tokens or MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)}
-    if payload.temperature is not None:
-        options["temperature"] = payload.temperature
-    if payload.options:
-        allowed_options = {"top_k", "top_p", "min_p", "typical_p", "repeat_last_n", "repeat_penalty", "presence_penalty", "frequency_penalty", "seed", "stop"}
-        if set(payload.options) - allowed_options:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported Ollama option")
-        options.update(payload.options)
-    try:
-        response = await app.state.http.post(f"{OLLAMA_URL}/api/chat", json={"model": model, "messages": [message.model_dump() for message in payload.messages], "stream": False, "think": payload.think, "options": options})
-        response.raise_for_status()
-        upstream = response.json()
-    except httpx.HTTPError as exc:
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        await log_usage(key["id"], request_id, 0, 0, duration_ms, 502)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Ollama inference failed") from exc
-    duration_ms = int((time.perf_counter() - started) * 1000)
-    prompt_tokens = int(upstream.get("prompt_eval_count", 0))
-    completion_tokens = int(upstream.get("eval_count", 0))
-    await log_usage(key["id"], request_id, prompt_tokens, completion_tokens, duration_ms, 200)
-    return {
-        "id": f"chatcmpl-{request_id}", "object": "chat.completion", "created": int(time.time()), "model": "default",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": upstream["message"]["content"]}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens},
-    }
-
 
 @app.get("/admin", response_class=HTMLResponse)
 async def dashboard(_: str = Depends(admin)) -> str:
