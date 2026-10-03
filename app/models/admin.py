@@ -28,3 +28,7 @@ class CreateApiKeyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     scopes: set[str] = Field(min_length=1)
     expires_at: datetime | None = None
+
+
+class UpdateApiKeyRequest(BaseModel):
+    enabled: bool

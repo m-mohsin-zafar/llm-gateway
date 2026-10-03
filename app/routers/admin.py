@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import hmac
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.templating import Jinja2Templates
+
+from app.config import Settings
+from app.models.admin import CreateApiKeyRequest, UpdateApiKeyRequest
+
+
+def create_admin_router(settings: Settings) -> APIRouter:
+    router = APIRouter(tags=["admin"], include_in_schema=False)
+    templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
+    basic = HTTPBasic()
+
+    def authenticate(credentials: HTTPBasicCredentials = Depends(basic)) -> None:
+        if not (hmac.compare_digest(credentials.username, settings.admin_username) and hmac.compare_digest(credentials.password, settings.admin_password)):
+            raise HTTPException(401, "Invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
+
+    def csrf(x_requested_with: str | None = Header(default=None)) -> None:
+        if x_requested_with != "llm-gateway-admin":
+            raise HTTPException(403, "Missing admin CSRF header")
+
+    def keys(request: Request):
+        return request.app.state.services.keys
+
+    @router.get("/admin", response_class=HTMLResponse)
+    async def dashboard(request: Request, _: None = Depends(authenticate)):
+        return templates.TemplateResponse(request, "admin.html", {"settings": settings, "keys": await keys(request).list()})
+
+    @router.get("/admin/api-keys")
+    async def list_keys(request: Request, _: None = Depends(authenticate)):
+        return [key.model_dump(mode="json") for key in await keys(request).list()]
+
+    @router.post("/admin/api-keys", status_code=201)
+    async def create(payload: CreateApiKeyRequest, request: Request, _: None = Depends(authenticate), __: None = Depends(csrf)):
+        return (await keys(request).create(payload.name, payload.scopes, payload.expires_at)).model_dump(mode="json")
+
+    @router.post("/admin/api-keys/{public_id}/rotate", status_code=201)
+    async def rotate(public_id: str, request: Request, _: None = Depends(authenticate), __: None = Depends(csrf)):
+        return (await keys(request).rotate(public_id)).model_dump(mode="json")
+
+    @router.patch("/admin/api-keys/{public_id}")
+    async def update(public_id: str, payload: UpdateApiKeyRequest, request: Request, _: None = Depends(authenticate), __: None = Depends(csrf)):
+        return (await keys(request).set_enabled(public_id, payload.enabled)).model_dump(mode="json")
+
+    @router.post("/admin/api-keys/{public_id}/revoke")
+    async def revoke(public_id: str, request: Request, _: None = Depends(authenticate), __: None = Depends(csrf)):
+        return (await keys(request).revoke(public_id)).model_dump(mode="json")
+
+    return router
